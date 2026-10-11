@@ -5,6 +5,7 @@ import json
 import os
 import queue
 import threading
+import time
 import traceback
 import tkinter as tk
 from pathlib import Path
@@ -20,6 +21,7 @@ from matplotlib.colors import LinearSegmentedColormap  # noqa: E402
 from matplotlib.figure import Figure  # noqa: E402
 
 import demo  # noqa: E402
+import gateway  # noqa: E402
 from analytics import Settings  # noqa: E402
 from pipeline import compute, load_data  # noqa: E402
 
@@ -28,11 +30,14 @@ C_BG, C_SIDE, C_CARD, C_LINE = "#0f1115", "#14171c", "#1a1d24", "#262a33"
 C_TXT, C_MUTED = "#e8eaed", "#8b919c"
 C_ACC, C_GREEN, C_RED, C_AMBER = "#4c9be8", "#3ecf8e", "#ff6b6b", "#f0b429"
 FONT = "Segoe UI"
-PRESETS = {"TWS - Live (7496)": 7496, "TWS - Paper (7497)": 7497,
-           "IB Gateway - Live (4001)": 4001, "IB Gateway - Paper (4002)": 4002}
 CFG_PATH = Path(os.getenv("APPDATA") or Path.home()) / "IBKR-Advisor" / "config.json"
-DEFAULTS = dict(host="127.0.0.1", port=7496, client_id=17, years="1", rf="3.0", max_w="20",
-                vol="", extras="", fmp_key="")
+DEFAULTS = dict(host="127.0.0.1", port=4001, client_id=17, gateway_path="", years="1", rf="3.0",
+                max_w="20", vol="", extras="", fmp_key="")
+# connection state -> (dot colour, sidebar text)
+CONN = {"up": (C_GREEN, "IB Gateway connected"),
+        "starting": (C_AMBER, "Waiting for IB Gateway login..."),
+        "down": (C_RED, "IB Gateway not running - click to launch"),
+        "error": (C_RED, "")}
 ACTION_COLOR = {"CLOSE": C_RED, "SELL (REDUCE)": "#ff9f6b", "BUY MORE": C_GREEN,
                 "BUY (NEW)": C_ACC, "HOLD": C_MUTED}
 HEAT = LinearSegmentedColormap.from_list("heat", ["#b3453f", "#2a2d35", "#2f9e6e"])
@@ -150,57 +155,20 @@ class Dialog(ctk.CTkToplevel):
                      height=32).grid(row=row, column=1, sticky="ew")
 
 
-class ConnectDialog(Dialog):
-    def __init__(self, master, cfg, on_connect):
-        super().__init__(master, "Connect to Interactive Brokers", "480x470")
-        self.cfg, self.on_connect = cfg, on_connect
-        ctk.CTkLabel(self, text="Connect to your IBKR portfolio", font=font(20, "bold")).pack(pady=(22, 6))
-        ctk.CTkLabel(self, justify="left", wraplength=410, text_color=C_MUTED, font=font(12),
-                     text="1. Start TWS or IB Gateway and log in.\n"
-                          "2. Enable the API: Configuration > API > Settings > 'Enable ActiveX and "
-                          "Socket Clients'.\nRead-only: this app never places orders.").pack()
-        form = ctk.CTkFrame(self, fg_color="transparent")
-        form.pack(fill="x", padx=36, pady=14)
-        form.columnconfigure(1, weight=1)
-        self.preset = tk.StringVar(value=next((k for k, v in PRESETS.items() if v == cfg["port"]), "TWS - Live (7496)"))
-        self.host, self.port, self.cid = (tk.StringVar(value=str(cfg[k])) for k in ("host", "port", "client_id"))
-        ctk.CTkLabel(form, text="Platform", text_color=C_MUTED, font=font(12)).grid(row=0, column=0, sticky="w", pady=7)
-        ctk.CTkOptionMenu(form, variable=self.preset, values=list(PRESETS), height=32,
-                          command=lambda k: self.port.set(str(PRESETS[k]))).grid(row=0, column=1, sticky="ew")
-        self.field(form, 1, "Host", self.host)
-        self.field(form, 2, "Port", self.port)
-        self.field(form, 3, "Client ID", self.cid)
-        self.err = ctk.CTkLabel(self, text="", text_color=C_RED)
-        self.err.pack()
-        ctk.CTkButton(self, text="Connect & analyze", height=40, font=font(14, "bold"),
-                      command=self.submit).pack(fill="x", padx=36, pady=(8, 6))
-        ctk.CTkButton(self, text="Try demo data (no IBKR needed)", height=32, fg_color="transparent",
-                      border_width=1, border_color=C_LINE, text_color=C_MUTED,
-                      command=lambda: (self.destroy(), on_connect(None))).pack(fill="x", padx=36)
-
-    def submit(self):
-        try:
-            conn = dict(host=self.host.get().strip() or "127.0.0.1", port=int(self.port.get()),
-                        client_id=int(self.cid.get()))
-        except ValueError:
-            self.err.configure(text="Port and client ID must be integers.")
-            return
-        self.destroy()
-        self.on_connect(conn)
-
-
 class SettingsDialog(Dialog):
     def __init__(self, master, cfg, on_save):
-        super().__init__(master, "Settings", "500x520")
+        super().__init__(master, "Settings", "520x690")
         self.cfg, self.on_save = cfg, on_save
         ctk.CTkLabel(self, text="Settings", font=font(20, "bold")).pack(pady=(22, 4))
         form = ctk.CTkFrame(self, fg_color="transparent")
         form.pack(fill="x", padx=36, pady=10)
         form.columnconfigure(1, weight=1)
-        self.vars = {k: tk.StringVar(value=str(cfg[k])) for k in ("years", "rf", "max_w", "vol", "extras", "fmp_key")}
-        rows = [("History (years, 1-5)  *", "years"), ("Risk-free rate (%)", "rf"),
+        rows = [("IB Gateway path (blank = auto)", "gateway_path"), ("API host", "host"),
+                ("API port (live: 4001)", "port"), ("Client ID", "client_id"),
+                ("History (years, 1-5)  *", "years"), ("Risk-free rate (%)", "rf"),
                 ("Max weight per position (%)", "max_w"), ("Volatility cap (%, optional)", "vol"),
                 ("Extra candidate tickers  *", "extras"), ("FMP API key (P/E history)  *", "fmp_key")]
+        self.vars = {k: tk.StringVar(value=str(cfg[k])) for _, k in rows}
         for i, (label, k) in enumerate(rows):
             self.field(form, i, label, self.vars[k], show="*" if k == "fmp_key" else None)
         ctk.CTkLabel(self, wraplength=420, justify="left", text_color=C_MUTED, font=font(11),
@@ -208,11 +176,19 @@ class SettingsDialog(Dialog):
                           "Yahoo's last ~4 annual reports. A free key from financialmodelingprep.com gives "
                           "longer history (up to 15 years, depending on your plan). The key is stored in "
                           "plain text in your user profile.").pack(padx=36, pady=6, anchor="w")
-        ctk.CTkButton(self, text="Save", height=38, command=self.save).pack(fill="x", padx=36, pady=14)
+        self.err = ctk.CTkLabel(self, text="", text_color=C_RED)
+        self.err.pack()
+        ctk.CTkButton(self, text="Save", height=38, command=self.save).pack(fill="x", padx=36, pady=(4, 14))
 
     def save(self):
-        for k, v in self.vars.items():
-            self.cfg[k] = v.get().strip()
+        vals = {k: v.get().strip() for k, v in self.vars.items()}
+        try:
+            vals["port"], vals["client_id"] = int(vals["port"]), int(vals["client_id"])
+        except ValueError:
+            self.err.configure(text="Port and client ID must be integers.")
+            return
+        vals["host"] = vals["host"] or "127.0.0.1"
+        self.cfg.update(vals)
         save_cfg(self.cfg)
         self.destroy()
         self.on_save()
@@ -232,12 +208,14 @@ class App(ctk.CTk):
         self.cfg = load_cfg()
         self.q: queue.Queue = queue.Queue()
         self.busy, self.raw, self.result = False, None, None
+        self.conn, self.auto_loaded = None, False
+        self.launch_req, self.wake = False, threading.Event()
         self._style_tables()
         self._sidebar()
         self._content()
         self.show_page("overview")
         self.after(150, self._poll)
-        self.after(500, self.open_connect)
+        threading.Thread(target=self._watch_gateway, daemon=True).start()
 
     # ------------------------------------------------------------ layout
     def _style_tables(self):
@@ -274,19 +252,30 @@ class App(ctk.CTk):
                                            fg_color=C_LINE)
         self.progress.pack(fill="x", pady=(0, 6))
         self.progress.set(0)
-        self.status = ctk.CTkLabel(bottom, text="Not connected", text_color=C_MUTED, font=font(11),
+        self.status = ctk.CTkLabel(bottom, text="", text_color=C_MUTED, font=font(11),
                                    wraplength=200, justify="left", anchor="w")
-        self.status.pack(fill="x", pady=(0, 10))
-        ctk.CTkButton(bottom, text="Connect to IBKR...", height=36, command=self.open_connect).pack(fill="x", pady=3)
+        self.status.pack(fill="x", pady=(0, 6))
+        conn = ctk.CTkFrame(bottom, fg_color=C_CARD, corner_radius=8)
+        conn.pack(fill="x", pady=(0, 8))
+        self.conn_dot = ctk.CTkLabel(conn, text="\u25cf", text_color=C_MUTED, font=font(16), width=18)
+        self.conn_dot.pack(side="left", padx=(10, 4), pady=6)
+        self.conn_lbl = ctk.CTkLabel(conn, text="Checking IB Gateway...", text_color=C_MUTED, font=font(11),
+                                     wraplength=160, justify="left", anchor="w")
+        self.conn_lbl.pack(side="left", fill="x", expand=True, padx=(0, 8), pady=6)
+        for w in (conn, self.conn_dot, self.conn_lbl):
+            w.bind("<Button-1>", self._conn_click)
         self.btn_refresh = ctk.CTkButton(bottom, text="Refresh data", height=32, fg_color="#232833",
-                                         hover_color="#2b3140", state="disabled", command=self.refresh)
+                                         hover_color="#2b3140", command=self.refresh)
         self.btn_refresh.pack(fill="x", pady=3)
         self.btn_re = ctk.CTkButton(bottom, text="Re-analyze", height=32, fg_color="#232833",
                                     hover_color="#2b3140", state="disabled", command=self.reanalyze)
         self.btn_re.pack(fill="x", pady=3)
         ctk.CTkButton(bottom, text="Settings", height=32, fg_color="transparent", border_width=1,
                       border_color=C_LINE, text_color=C_MUTED,
-                      command=lambda: SettingsDialog(self, self.cfg, self.reanalyze)).pack(fill="x", pady=3)
+                      command=lambda: SettingsDialog(self, self.cfg, self._settings_saved)).pack(fill="x", pady=3)
+        ctk.CTkButton(bottom, text="Try demo data", height=26, fg_color="transparent", hover_color="#1d222b",
+                      text_color=C_MUTED, font=font(11),
+                      command=lambda: self._start(demo_mode=True)).pack(fill="x", pady=(3, 0))
 
     def _content(self):
         main = ctk.CTkFrame(self, fg_color="transparent")
@@ -295,7 +284,7 @@ class App(ctk.CTk):
         head.pack(fill="x")
         self.title_lbl = ctk.CTkLabel(head, text="Overview", font=font(26, "bold"), anchor="w")
         self.title_lbl.pack(anchor="w")
-        self.sub_lbl = ctk.CTkLabel(head, text="Connect to your account to start.", text_color=C_MUTED,
+        self.sub_lbl = ctk.CTkLabel(head, text="Log in to IB Gateway to load your portfolio.", text_color=C_MUTED,
                                     font=font(13), anchor="w", justify="left")
         self.sub_lbl.pack(anchor="w", pady=(2, 0))
         self.warn_lbl = ctk.CTkLabel(main, text="", text_color=C_AMBER, font=font(12), anchor="w",
@@ -398,17 +387,55 @@ class App(ctk.CTk):
         self.current = key
 
     # ------------------------------------------------------------ actions
-    def open_connect(self):
-        if not self.busy:
-            ConnectDialog(self, self.cfg, self._connected)
+    def _watch_gateway(self):
+        """Background thread: launch IB Gateway at startup if needed, then probe its API port."""
+        launched_at = None
+        try:
+            if not gateway.port_open(self.cfg["host"], int(self.cfg["port"])) and not gateway.is_running():
+                exe = gateway.launch(self.cfg["gateway_path"])
+                launched_at = time.time()
+                self.q.put(("status", f"Started {exe}"))
+        except Exception as e:  # noqa: BLE001
+            self.q.put(("conn", ("error", str(e))))
+            self.wake.wait(5)
+        while True:
+            self.wake.clear()
+            try:
+                if self.launch_req:
+                    self.launch_req = False
+                    gateway.launch(self.cfg["gateway_path"])
+                    launched_at = time.time()
+                if gateway.port_open(self.cfg["host"], int(self.cfg["port"])):
+                    state = ("up", "")
+                elif gateway.is_running() or (launched_at and time.time() - launched_at < 120):
+                    state = ("starting", "")
+                else:
+                    state = ("down", "")
+            except Exception as e:  # noqa: BLE001
+                state = ("error", str(e))
+            self.q.put(("conn", state))
+            self.wake.wait(3)
 
-    def _connected(self, conn):
-        if conn is None:
-            self._start(demo_mode=True)
-            return
-        self.cfg.update(conn)
-        save_cfg(self.cfg)
-        self.refresh()
+    def _conn_click(self, _e=None):
+        if self.conn in ("down", "error"):
+            self.launch_req = True
+            self.conn_lbl.configure(text="Launching IB Gateway...")
+            self.wake.set()
+
+    def _set_conn(self, state, detail):
+        color, text = CONN[state]
+        self.conn_dot.configure(text_color=color)
+        self.conn_lbl.configure(text=detail or text)
+        for w in (self.conn_dot, self.conn_lbl):
+            w.configure(cursor="hand2" if state in ("down", "error") else "")
+        if state == "up" and not self.auto_loaded and not self.busy:
+            self.auto_loaded = True  # first login -> load the portfolio automatically
+            self.refresh()
+        self.conn = state
+
+    def _settings_saved(self):
+        self.wake.set()  # re-probe in case host/port changed
+        self.reanalyze()
 
     def settings(self) -> Settings:
         vol = flt(self.cfg["vol"], 0.0)
@@ -455,7 +482,9 @@ class App(ctk.CTk):
         try:
             while True:
                 kind, payload = self.q.get_nowait()
-                if kind == "status":
+                if kind == "conn":
+                    self._set_conn(*payload)
+                elif kind == "status":
                     self.status.configure(text=payload)
                 elif kind == "raw":
                     self.raw = payload

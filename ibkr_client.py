@@ -1,4 +1,4 @@
-"""Read-only IBKR access through TWS / IB Gateway (ib_async)."""
+"""Read-only IBKR access through IB Gateway (ib_async)."""
 from __future__ import annotations
 
 import asyncio
@@ -22,7 +22,7 @@ def fetch_portfolio(host: str, port: int, client_id: int, years: int, say):
         ib.connect(host, port, clientId=client_id, readonly=True, timeout=20)
     except Exception as e:
         raise ConnectionError(
-            f"Could not connect to {host}:{port}. Is TWS / IB Gateway running with the API "
+            f"Could not connect to {host}:{port}. Is IB Gateway running and logged in, with the API "
             f"enabled (and this port)? Details: {e!r}")
     try:
         vals = ib.accountValues()

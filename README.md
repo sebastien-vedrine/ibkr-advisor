@@ -5,16 +5,19 @@ portfolio, tracks the Sharpe ratio and suggests trades plus new candidates.
 
 ## Run
 1. `pip install -r requirements.txt`
-2. Start **TWS** or **IB Gateway**, log in, then enable the API:
-   Configuration > API > Settings > *Enable ActiveX and Socket Clients*
-   (ports: TWS 7496 live / 7497 paper, Gateway 4001 live / 4002 paper).
-3. `python main.py` -> the connection dialog opens -> *Connect & analyze*.
+2. In IB Gateway (live), enable the API once: Configure > Settings > API > Settings >
+   *Enable ActiveX and Socket Clients* (default live port 4001).
+3. `python main.py` -> the app launches IB Gateway (if not already running), you log in, and the
+   portfolio loads automatically. The sidebar dot shows the connection: green = connected,
+   amber = waiting for login, red = not running (click it to launch the Gateway).
+   The Gateway is found under `C:\Jts\ibgateway\<version>`; otherwise set its path in Settings
+   (along with host / port / client ID).
 
 Single .exe: run `build.bat` (output: `dist\IBKR-Advisor.exe`).
 Offline test with synthetic data: `python test_analytics.py`.
 
 ## What it does
-(New UI: sidebar navigation, KPI cards, sector heatmap. No TWS? Use **Try demo data** in the connect dialog.)
+(New UI: sidebar navigation, KPI cards, sector heatmap. No IBKR? Use **Try demo data** in the sidebar.)
 
 - **Overview**: Sharpe, return, volatility, max drawdown, 1-day VaR, beta vs SPY, effective number
   of positions, diversification ratio - current vs proposed - plus charts.
