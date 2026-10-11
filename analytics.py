@@ -189,7 +189,7 @@ def analyze(positions: list[Position], prices: pd.DataFrame, cand_prices: pd.Dat
         pc = perf(r_c, s.rf)
         m = meta.get(c, ("", ""))
         crow.append(dict(symbol=c, name=m[0], category=m[1], ret=pc["ret"], vol=pc["vol"],
-                         sharpe=pc["sharpe"], corr=r_c.corr(port_r),
+                         sharpe=pc["sharpe"], mdd=pc["mdd"], corr=r_c.corr(port_r),
                          d_sharpe=np_["sharpe"] - cur["sharpe"], d_vol=np_["vol"] - cur["vol"],
                          price=float(allp[c].dropna().iloc[-1])))
     crow.sort(key=lambda d: d["d_sharpe"], reverse=True)

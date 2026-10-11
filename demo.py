@@ -1,4 +1,4 @@
-"""Synthetic data so you can explore the app without TWS / internet."""
+"""Synthetic data so you can explore the app without IBKR / internet."""
 from __future__ import annotations
 
 import numpy as np
@@ -32,8 +32,14 @@ def make_demo_raw(seed: int = 11) -> dict:
     sp = pd.DataFrame({e: px(drift[e], .16, 1.0) for e in SECTORS})
     sp["SPY"] = px(.10, .15, 1.0)
 
+    year = pd.Timestamp.today().year - 1
+
     def v(pe, a5, a10, a15, fwd=None, n=(5, 10, 15), src="FMP"):
-        return dict(pe=pe, fwd=fwd, avg5=a5, n5=n[0], avg10=a10, n10=n[1], avg15=a15, n15=n[2], source=src)
+        # 15 synthetic annual P/Es whose 5/10/15y means roughly match the averages
+        lvl = [a5] * 5 + [2 * a10 - a5] * 5 + [3 * a15 - 2 * a10] * 5
+        hist = [(str(year - i), round(x * (1 + 0.12 * np.sin(1.7 * i)), 1)) for i, x in enumerate(lvl)]
+        return dict(pe=pe, fwd=fwd, avg5=a5, n5=n[0], avg10=a10, n10=n[1], avg15=a15, n15=n[2], source=src,
+                    hist=hist, info={})
 
     val = {"AAPL": v(33.8, 28.1, 24.3, 20.2, 30.1), "MSFT": v(36.2, 33.5, 31.0, 27.4, 31.8),
            "NVDA": v(52.4, 62.0, 48.7, 38.9, 33.0), "JNJ": v(16.1, 22.7, 21.4, 19.9, 15.0),

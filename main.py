@@ -23,7 +23,10 @@ from matplotlib.figure import Figure  # noqa: E402
 import demo  # noqa: E402
 import gateway  # noqa: E402
 from analytics import Settings  # noqa: E402
+from market_data import norm  # noqa: E402
 from pipeline import compute, load_data  # noqa: E402
+from universe import UNIVERSE  # noqa: E402
+from valuation import get_valuations, signal  # noqa: E402
 
 # ---------------------------------------------------------------- theme
 C_BG, C_SIDE, C_CARD, C_LINE = "#0f1115", "#14171c", "#1a1d24", "#262a33"
@@ -40,6 +43,10 @@ CONN = {"up": (C_GREEN, "IB Gateway connected"),
         "error": (C_RED, "")}
 ACTION_COLOR = {"CLOSE": C_RED, "SELL (REDUCE)": "#ff9f6b", "BUY MORE": C_GREEN,
                 "BUY (NEW)": C_ACC, "HOLD": C_MUTED}
+# candidate rating from the Sharpe change of a 5% allocation: (minimum d_sharpe, label, colour)
+FIT = [(0.04, "Strong", C_GREEN), (0.015, "Good", "#8fdcb4"), (0.002, "Slight", C_TXT),
+       (-0.002, "Neutral", C_MUTED), (-np.inf, "Worse", C_RED)]
+SIGNAL_COLOR = {"Cheap": C_GREEN, "Expensive": C_RED, "Fair": C_TXT, "-": C_MUTED}
 HEAT = LinearSegmentedColormap.from_list("heat", ["#b3453f", "#2a2d35", "#2f9e6e"])
 
 
@@ -70,6 +77,19 @@ def pct(x, d=1, sign=False):
 
 def num(x, d=2):
     return "-" if isnan(x) else f"{x:,.{d}f}"
+
+
+def fit(d_sharpe: float) -> tuple[str, str]:
+    return next(((label, color) for lim, label, color in FIT if d_sharpe >= lim), FIT[3][1:])  # NaN -> Neutral
+
+
+def big(x):
+    if isnan(x):
+        return "-"
+    for div, unit in ((1e12, "T"), (1e9, "B"), (1e6, "M")):
+        if abs(x) >= div:
+            return f"{x / div:,.1f}{unit}"
+    return f"{x:,.0f}"
 
 
 def flt(text: str, default: float) -> float:
@@ -194,6 +214,186 @@ class SettingsDialog(Dialog):
         self.on_save()
 
 
+class StockView(ctk.CTkToplevel):
+    """Detail window for one stock: valuation, P/E history, price vs SPY and portfolio fit."""
+    TILES = [("pe", "P/E (TTM)"), ("fwd", "Forward P/E"), ("avg", "Avg P/E 10y"), ("prem", "vs average"),
+             ("peg", "PEG"), ("div", "Dividend yield")]
+
+    def __init__(self, app, sym):
+        super().__init__(app, fg_color=C_BG)
+        self.sym, self.raw, self.res = sym, app.raw, app.result
+        self.cache, self.done = self.raw["valuation"], False
+        self.title(f"{sym} - details")
+        self.geometry("1040x760")
+        self.minsize(880, 640)
+        self.transient(app)
+        self.after(200, lambda: (self.lift(), self.focus_force()))
+
+        head = ctk.CTkFrame(self, fg_color="transparent")
+        head.pack(fill="x", padx=24, pady=(20, 0))
+        self.name_lbl = ctk.CTkLabel(head, text=sym, font=font(24, "bold"), anchor="w")
+        self.name_lbl.pack(anchor="w")
+        self.sub_lbl = ctk.CTkLabel(head, text="", text_color=C_MUTED, font=font(13), anchor="w")
+        self.sub_lbl.pack(anchor="w")
+        row = ctk.CTkFrame(self, fg_color="transparent")
+        row.pack(fill="x", padx=24, pady=(14, 0))
+        self.tiles = {}
+        for i, (k, title) in enumerate(self.TILES):
+            row.columnconfigure(i, weight=1, uniform="t")
+            card = ctk.CTkFrame(row, fg_color=C_CARD, corner_radius=12)
+            card.grid(row=0, column=i, sticky="nsew", padx=(0 if i == 0 else 10, 0))
+            t = ctk.CTkLabel(card, text=title, text_color=C_MUTED, font=font(11), anchor="w")
+            t.pack(anchor="w", padx=14, pady=(10, 0))
+            v = ctk.CTkLabel(card, text="-", font=font(20, "bold"), anchor="w")
+            v.pack(anchor="w", padx=14, pady=(0, 10))
+            self.tiles[k] = (t, v)
+        self.more_lbl = ctk.CTkLabel(self, text="", text_color=C_MUTED, font=font(12), anchor="w",
+                                     justify="left", wraplength=980)
+        self.more_lbl.pack(fill="x", padx=24, pady=(10, 0))
+        card, self.fig, self.cv = mpl_card(self, (9.8, 3.6))
+        card.pack(fill="both", expand=True, padx=24, pady=10)
+        self.fit_lbl = ctk.CTkLabel(self, text="", font=font(12), anchor="w", justify="left", wraplength=980)
+        self.fit_lbl.pack(fill="x", padx=24, pady=(0, 18))
+
+        if sym in self.cache or self.raw.get("offline"):
+            self.done = True
+            self._render()
+        else:
+            self._render()
+            threading.Thread(target=self._fetch, daemon=True).start()
+            self.after(200, self._wait)
+
+    def _fetch(self):
+        try:
+            get_valuations([self.sym], self.raw.get("fmp_key", ""), self.cache, norm=norm)
+        finally:
+            self.done = True
+
+    def _wait(self):
+        if not self.winfo_exists():
+            return
+        if self.done:
+            self._render()
+        else:
+            self.after(200, self._wait)
+
+    def _render(self):
+        sym, res = self.sym, self.res
+        v = self.cache.get(sym) or {}
+        info = v.get("info") or {}
+        held = next((d for d in res["positions"] if d["symbol"] == sym), None)
+        cand = next((d for d in res["candidates"] if d["symbol"] == sym), None)
+        meta = UNIVERSE.get(sym, ("", ""))
+        tgt = res["weights_tgt"].get(sym, 0.0)
+
+        self.name_lbl.configure(text=f"{sym}   {info.get('name') or meta[0]}".rstrip())
+        cur = info.get("currency") or (held["currency"] if held else "")
+        price = info.get("price") or (held["price"] if held else cand["price"] if cand else None)
+        self.sub_lbl.configure(text="   -   ".join(x for x in (
+            " / ".join(x for x in (info.get("sector"), info.get("industry")) if x) or meta[1],
+            f"Held, {pct(held['weight'])} of analysed capital" if held else "Candidate",
+            f"{price:,.2f} {cur}".strip() if price else "",
+            f"Market cap {big(info['mcap'])}" if info.get("mcap") else "") if x))
+
+        prem, label = signal(v) if v else (None, "-")
+        ref_n = v.get("n10") if v.get("avg10") else v.get("n5")
+        tiles = dict(pe=(num(v.get("pe"), 1), C_TXT), fwd=(num(v.get("fwd"), 1), C_TXT),
+                     avg=(num(v.get("avg10") or v.get("avg5"), 1), C_TXT),
+                     prem=(f"{pct(prem, 0, True)}  {label}" if prem is not None else "-", SIGNAL_COLOR[label]),
+                     peg=(num(info.get("peg")), C_TXT), div=(pct(info.get("div")), C_TXT))
+        for k, (text, color) in tiles.items():
+            self.tiles[k][1].configure(text=text, text_color=color)
+        self.tiles["avg"][0].configure(text=f"Avg P/E ({ref_n}y)" if ref_n else "Avg P/E")
+
+        if not self.done:
+            more = "Loading valuation from Yahoo Finance..."
+        elif not v:
+            more = "No valuation data (demo mode)." if self.raw.get("offline") else "No valuation data found."
+        else:
+            parts = [("P/B", num(info.get("pb"))), ("P/S", num(info.get("ps"))),
+                     ("EV/EBITDA", num(info.get("ev_ebitda"), 1)), ("Profit margin", pct(info.get("margin"))),
+                     ("ROE", pct(info.get("roe"))), ("Earnings growth", pct(info.get("growth"), 1, True))]
+            line = [f"{k} {x}" for k, x in parts if x != "-"]
+            if info.get("lo52") and info.get("hi52"):
+                line.append(f"52w range {info['lo52']:,.2f} - {info['hi52']:,.2f}")
+            lines = ["   ".join(line)]
+            if info.get("target") and price:
+                lines.append(f"Analyst target {info['target']:,.2f} ({info['target'] / price - 1:+.0%} vs price)"
+                             + (f", {info['n_analysts']:.0f} analysts" if info.get("n_analysts") else "")
+                             + (f", consensus '{info['rec'].replace('_', ' ')}'" if info.get("rec") else ""))
+            if v.get("source", "-") != "-":
+                lines.append(f"P/E history source: {v['source']}.")
+            more = "\n".join(x for x in lines if x)
+        self.more_lbl.configure(text=more)
+
+        if held:
+            sug = next((x for x in res["suggestions"] if x["symbol"] == sym), None)
+            text = (f"In your portfolio: {pct(held['risk'])} of the risk for {pct(held['weight'])} of the capital, "
+                    f"correlation {num(held['corr'])} with the rest. Return {pct(held['ret'])}, volatility "
+                    f"{pct(held['vol'])}, Sharpe {num(held['sharpe'])}. Proposed weight {pct(tgt)}.")
+            if sug:
+                text += f"\nSuggestion: {sug['action']} - {sug['why']}"
+            color = ACTION_COLOR.get(sug["action"], C_TXT) if sug else C_TXT
+        elif cand:
+            flabel, color = fit(cand["d_sharpe"])
+            text = (f"Portfolio fit: {flabel}. Putting 5% in it moves your Sharpe {cand['d_sharpe']:+.3f} and "
+                    f"your volatility {cand['d_vol'] * 100:+.2f} pt (correlation {num(cand['corr'])} with your "
+                    f"portfolio). On its own: return {pct(cand['ret'])}, volatility {pct(cand['vol'])}, Sharpe "
+                    f"{num(cand['sharpe'])}, max drawdown {pct(cand['mdd'])}."
+                    + (f"\nThe proposal gives it {pct(tgt)}." if tgt > 0 else "\nNot in the proposal."))
+        else:
+            text, color = "", C_TXT
+        self.fit_lbl.configure(text=text, text_color=color)
+        self._draw(v)
+
+    def _draw(self, v):
+        self.fig.clear()
+        ax1, ax2 = self.fig.subplots(1, 2, gridspec_kw={"width_ratios": [3, 2]})
+        for ax in (ax1, ax2):
+            style_axes(ax)
+            ax.grid(color=C_LINE, lw=0.6, axis="y")
+            ax.set_axisbelow(True)
+        start = self.res["curves"].index[0]
+        for frame in (self.raw["hist"], self.raw["cands"]):
+            if self.sym in frame.columns:
+                px = frame[self.sym].dropna().loc[start:]
+                if len(px) > 1:
+                    ax1.plot(px.index, px / px.iloc[0], color=C_ACC, lw=1.8, label=self.sym)
+                break
+        bench = self.raw.get("bench")
+        if bench is not None:
+            b = bench.dropna().loc[start:]
+            if len(b) > 1:
+                ax1.plot(b.index, b / b.iloc[0], color="#777c88", lw=1.4, label="SPY")
+        ax1.set_title("Growth of 1 over the analysis period", color=C_TXT, fontsize=11, loc="left")
+        ax1.legend(facecolor=C_CARD, labelcolor=C_TXT, edgecolor=C_LINE, fontsize=9, frameon=False)
+
+        hist = list(reversed(v.get("hist") or []))
+        ax2.set_title("Annual P/E", color=C_TXT, fontsize=11, loc="left")
+        if hist:
+            x = np.arange(len(hist))
+            ax2.bar(x, [pe or 0 for _, pe in hist], 0.7, color=C_ACC, alpha=0.75)
+            for i, (_, pe) in enumerate(hist):
+                if pe is None:
+                    ax2.text(i, 0, "n/a", color=C_MUTED, fontsize=7, ha="center", va="bottom", rotation=90)
+            ax2.set_xticks(x, [y[-2:] if len(hist) > 8 else y for y, _ in hist])
+            ref = v.get("avg10") or v.get("avg5")
+            if ref:
+                ax2.axhline(ref, color=C_MUTED, ls=":", lw=1.4, label=f"avg {ref:.1f}")
+            if v.get("pe"):
+                _, label = signal(v)
+                ax2.axhline(v["pe"], color=SIGNAL_COLOR[label] if label != "Fair" else C_AMBER, ls="--",
+                            lw=1.6, label=f"now {v['pe']:.1f}")
+            ax2.legend(facecolor=C_CARD, labelcolor=C_TXT, edgecolor=C_LINE, fontsize=9, frameon=False)
+        else:
+            ax2.set_xticks([])
+            ax2.set_yticks([])
+            ax2.text(0.5, 0.5, "Loading..." if not self.done else "No P/E history\n(ETF, losses or no data)",
+                     color=C_MUTED, ha="center", va="center", transform=ax2.transAxes)
+        self.fig.tight_layout()
+        self.cv.draw()
+
+
 # ---------------------------------------------------------------- app
 class App(ctk.CTk):
     PAGES = [("overview", "Overview"), ("suggestions", "Suggestions"), ("positions", "Positions"),
@@ -210,6 +410,7 @@ class App(ctk.CTk):
         self.busy, self.raw, self.result = False, None, None
         self.conn, self.auto_loaded = None, False
         self.launch_req, self.wake = False, threading.Event()
+        self.views: dict[str, StockView] = {}
         self._style_tables()
         self._sidebar()
         self._content()
@@ -333,10 +534,11 @@ class App(ctk.CTk):
         card.pack(fill="both", expand=True)
         for a, c in ACTION_COLOR.items():
             self.t_sug.tag_configure(a, foreground=c)
-        self.sug_detail = ctk.CTkLabel(p, text="Select a row to read the full reasoning.", text_color=C_MUTED,
+        self.sug_detail = ctk.CTkLabel(p, text="Select a row to read the full reasoning, double-click for details.", text_color=C_MUTED,
                                        font=font(12), anchor="w", justify="left", wraplength=1000, height=44)
         self.sug_detail.pack(fill="x", pady=(8, 0))
         self.t_sug.bind("<<TreeviewSelect>>", self._sug_select)
+        self._bind_open(self.t_sug, "<Double-1>")
 
     def _sug_select(self, _e=None):
         sel = self.t_sug.selection()
@@ -349,6 +551,7 @@ class App(ctk.CTk):
             p, ("Symbol", "Qty", "Price", "Value", "Weight", "Return", "Vol", "Sharpe", "% of risk",
                 "Corr. rest", "Unreal. P&L"), (90, 80, 120, 110, 80, 80, 80, 80, 90, 90, 120), stretch="Unreal. P&L")
         card.pack(fill="both", expand=True)
+        self._bind_open(self.t_pos)
 
     def _page_valuation(self, p):
         self.val_note = ctk.CTkLabel(p, text="", text_color=C_MUTED, font=font(12), anchor="w",
@@ -358,8 +561,9 @@ class App(ctk.CTk):
             p, ("Symbol", "Held", "P/E (TTM)", "Fwd P/E", "Avg 5y", "Avg 10y", "Avg 15y", "vs avg", "Signal"),
             (90, 70, 90, 90, 100, 100, 100, 90, 110), left=(0, 8), stretch="Signal")
         card.pack(fill="both", expand=True)
-        for a, c in (("Cheap", C_GREEN), ("Expensive", C_RED), ("Fair", C_TXT), ("-", C_MUTED)):
+        for a, c in SIGNAL_COLOR.items():
             self.t_val.tag_configure(a, foreground=c)
+        self._bind_open(self.t_val)
 
     def _page_sectors(self, p):
         self._note(p, "S&P 500 sectors (SPDR ETFs) ranked by momentum score = average of 3M, 6M and 12-1M "
@@ -369,12 +573,44 @@ class App(ctk.CTk):
         card.pack(fill="both", expand=True)
 
     def _page_discover(self, p):
-        self._note(p, "Candidates ranked by how much adding 5% would improve your portfolio's Sharpe ratio "
-                      "(low correlation with your holdings helps most).")
+        self.cand_note = ctk.CTkLabel(p, text="", text_color=C_MUTED, font=font(12), anchor="w",
+                                      justify="left", wraplength=1000)
+        self.cand_note.pack(fill="x", pady=(0, 8))
+        card, self.fig_cand, self.cv_cand = mpl_card(p, (10, 2.5))
+        card.pack(fill="x", pady=(0, 10))
+        self.cv_cand.mpl_connect("pick_event", self._cand_pick)
         card, self.t_cand = make_table(
-            p, ("Symbol", "Name", "Category", "Return", "Vol", "Sharpe", "Corr.", "d Sharpe +5%", "d Vol +5%"),
-            (80, 230, 220, 80, 80, 80, 70, 110, 100), left=(0, 1, 2), stretch="Category")
+            p, ("Symbol", "Name", "Category", "Fit", "d Sharpe +5%", "d Vol +5%", "Corr.", "Return", "Vol",
+                "Sharpe", "Max DD", "Proposed"),
+            (75, 200, 190, 75, 105, 90, 65, 75, 70, 70, 80, 85), left=(0, 1, 2, 3), stretch="Name", height=8)
         card.pack(fill="both", expand=True)
+        for _, label, color in FIT:
+            self.t_cand.tag_configure(label, foreground=color)
+        self._bind_open(self.t_cand)
+
+    def _bind_open(self, tv, event="<ButtonRelease-1>"):
+        def handler(e):
+            row = tv.identify_row(e.y)
+            if row and tv.identify_region(e.x, e.y) == "cell":
+                self.open_stock(tv.item(row, "values")[0])
+        tv.bind(event, handler)
+
+    def _cand_pick(self, e):
+        i = getattr(e.artist, "cand_index", None)
+        if i is not None:
+            self.open_stock(self.result["candidates"][i]["symbol"])
+
+    def open_stock(self, sym):
+        if self.raw is None or self.result is None:
+            return
+        w = self.views.get(sym)
+        if w is not None and w.winfo_exists() and w.res is self.result:
+            w.lift()
+            w.focus_force()
+            return
+        if w is not None and w.winfo_exists():
+            w.destroy()  # opened on older results
+        self.views[sym] = StockView(self, sym)
 
     def show_page(self, key):
         for k, f in self.pages.items():
@@ -564,11 +800,26 @@ class App(ctk.CTk):
                 "Add a free FMP key in Settings for up to 15 years.") +
             "  Signal: Cheap < -15% vs the 10y average (5y if unavailable), Expensive > +15%. "
             "A low P/E can also mean falling earnings."))
-        for d in r["candidates"][:25]:
-            self.t_cand.insert("", "end", values=(
-                d["symbol"], d["name"], d["category"], pct(d["ret"]), pct(d["vol"]), num(d["sharpe"]),
-                num(d["corr"]), f"{d['d_sharpe']:+.3f}", f"{d['d_vol'] * 100:+.2f} pt"))
+        tgt = r["weights_tgt"]
+        for d in r["candidates"]:
+            label, _ = fit(d["d_sharpe"])
+            self.t_cand.insert("", "end", tags=(label,), values=(
+                d["symbol"], d["name"], d["category"], label, f"{d['d_sharpe']:+.3f}",
+                f"{d['d_vol'] * 100:+.2f} pt", num(d["corr"]), pct(d["ret"]), pct(d["vol"]), num(d["sharpe"]),
+                pct(d["mdd"]), pct(tgt[d["symbol"]]) if tgt.get(d["symbol"], 0) > 0 else "-"))
+        cands = r["candidates"]
+        good = [d for d in cands if d["d_sharpe"] >= FIT[2][0]]
+        self.cand_note.configure(text=(
+            f"{len(good)} of {len(cands)} candidates would raise your Sharpe ratio (now {num(c['sharpe'])}) if you "
+            f"put 5% in them" + (f"; best: {cands[0]['symbol']} ({cands[0]['d_sharpe']:+.3f})" if good else "") +
+            f". Fit: Strong >= +{FIT[0][0]}, Good >= +{FIT[1][0]}, Slight > 0. Low correlation with your holdings "
+            "helps most. Blue labels = in the proposal. Click a row or a bar for the stock's valuation."))
+        self._draw_candidates(r)
         self._draw_sectors(r["sectors"])
+        for sym, w in list(self.views.items()):  # refresh open detail windows
+            if w.winfo_exists():
+                w.destroy()
+                self.views[sym] = StockView(self, sym)
 
     def _draw_overview(self, r):
         self.fig_ov.clear()
@@ -592,6 +843,27 @@ class App(ctk.CTk):
         ax2.legend(facecolor=C_CARD, labelcolor=C_TXT, edgecolor=C_LINE, fontsize=9, frameon=False)
         self.fig_ov.tight_layout()
         self.cv_ov.draw()
+
+    def _draw_candidates(self, r):
+        self.fig_cand.clear()
+        ax = self.fig_cand.subplots()
+        style_axes(ax)
+        cands = r["candidates"]
+        x = np.arange(len(cands))
+        bars = ax.bar(x, [d["d_sharpe"] for d in cands], 0.7, color=[fit(d["d_sharpe"])[1] for d in cands])
+        for i, b in enumerate(bars):
+            b.set_picker(True)
+            b.cand_index = i
+        ax.axhline(0, color=C_LINE, lw=1)
+        ax.set_xticks(x, [d["symbol"] for d in cands], rotation=90, fontsize=8)
+        for t, d in zip(ax.get_xticklabels(), cands):
+            t.set_color(C_ACC if r["weights_tgt"].get(d["symbol"], 0) > 0 else C_MUTED)
+        ax.set_xlim(-0.6, len(cands) - 0.4)
+        ax.grid(color=C_LINE, lw=0.6, axis="y")
+        ax.set_axisbelow(True)
+        ax.set_title("Sharpe change if you put 5% in each candidate", color=C_TXT, fontsize=10, loc="left")
+        self.fig_cand.tight_layout()
+        self.cv_cand.draw()
 
     def _draw_sectors(self, rows):
         self.fig_sec.clear()
