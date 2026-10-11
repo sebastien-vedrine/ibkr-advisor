@@ -13,7 +13,14 @@ portfolio, tracks the Sharpe ratio and suggests trades plus new candidates.
    The Gateway is found under `C:\Jts\ibgateway\<version>`; otherwise set its path in Settings
    (along with host / port / client ID).
 
-Single .exe: run `build.bat` (output: `dist\IBKR-Advisor.exe`).
+Install: get **`Installer-IBKR-Advisor.exe`** from the latest GitHub release (or add
+`sebastien-vedrine/ibkr-advisor` to [Vedware](https://github.com/sebastien-vedrine/vedware), which
+also installs updates). Per-user install, no admin rights.
+
+Build the installer: run `build.bat` on Windows (installs Python / Inno Setup with winget if needed;
+output `dist\Installer-IBKR-Advisor.exe`), or push a tag matching `__version__` in `main.py`
+(e.g. `v1.1.0`): GitHub Actions builds it and publishes the release.
+
 Offline test with synthetic data: `python test_analytics.py`.
 
 ## What it does
@@ -31,7 +38,12 @@ Offline test with synthetic data: `python test_analytics.py`.
 - **Sector momentum**: the 11 S&P 500 sectors (SPDR ETFs) ranked by momentum (avg of 3M, 6M, 12-1M),
   with 1M/3M/6M/12M returns, relative strength vs SPY and the 200-day trend.
 - **Discover**: candidates (ETFs + large caps in `universe.py`, plus tickers you add) ranked by the
-  Sharpe gained if you put 5% in them.
+  Sharpe gained if you put 5% in them, with a fit rating (Strong / Good / Slight / Neutral / Worse), a
+  chart of the Sharpe change for every candidate, max drawdown and the weight the proposal gives them.
+- **Stock details**: click a stock in Discover, Positions or Valuation (double-click in Suggestions) to
+  open its own window: P/E vs its history (with an annual P/E chart), forward P/E, PEG, dividend yield,
+  P/B, P/S, EV/EBITDA, margins, analyst target, price vs SPY and how it fits your portfolio. Candidates'
+  data is fetched from Yahoo/FMP when the window opens.
 
 ## Method (and its limits)
 - Prices: IBKR daily history for your holdings (Yahoo fallback), Yahoo for candidates and SPY.

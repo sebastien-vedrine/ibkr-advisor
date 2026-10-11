@@ -1,6 +1,8 @@
 """IBKR Portfolio Advisor - Windows desktop app (read-only: never places orders)."""
 from __future__ import annotations
 
+__version__ = "1.1.0"
+
 import json
 import os
 import queue
@@ -402,7 +404,7 @@ class App(ctk.CTk):
     def __init__(self):
         super().__init__(fg_color=C_BG)
         ctk.set_appearance_mode("dark")
-        self.title("IBKR Portfolio Advisor")
+        self.title(f"IBKR Portfolio Advisor {__version__}")
         self.geometry("1360x860")
         self.minsize(1180, 740)
         self.cfg = load_cfg()
